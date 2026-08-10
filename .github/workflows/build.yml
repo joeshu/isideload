@@ -52,6 +52,9 @@ jobs:
       - name: Build
         run: cargo build -p minimal
 
+      - name: Test
+        run: cargo test -p isideload
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:

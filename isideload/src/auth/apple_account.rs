@@ -85,6 +85,35 @@ pub struct SMSTwoFactorError {
     pub message: String,
 }
 
+#[derive(Debug)]
+enum SmsSendOutcome {
+    Sent,
+    ActiveChallenge,
+    ServiceError(SMSTwoFactorError),
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SmsChallengeResponse {
+    mode: String,
+    #[serde(rename = "type")]
+    challenge_type: String,
+    authentication_type: String,
+    trusted_phone_numbers: Vec<TrustedNumber>,
+    trusted_phone_number: TrustedNumber,
+    security_code: SmsSecurityCode,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct SmsSecurityCode {
+    length: u8,
+    too_many_codes_sent: bool,
+    too_many_codes_validated: bool,
+    security_code_locked: bool,
+    security_code_cooldown: bool,
+}
+
 impl AppleAccount {
     /// Create a new AppleAccountBuilder with the given email
     ///
@@ -295,6 +324,9 @@ impl AppleAccount {
                     info!(
                         "The most recently attempted 2FA Method failed, please try a different method."
                     );
+                    if self.trusted_phone_numbers.is_none() {
+                        self.trusted_phone_numbers = Some(self.get_trusted_numbers().await?);
+                    }
                     let response = two_factor_callback(TwoFactorCallbackParams {
                         unknown: true,
                         last_error: self.last_error.clone(),
@@ -466,46 +498,46 @@ impl AppleAccount {
             .await
             .context("Failed to request SMS 2FA")?;
 
-        if !res.status().is_success() {
-            let status = res.status();
-            let text = res
-                .text()
+        let status = res.status();
+        let text = if status.is_success() {
+            String::new()
+        } else {
+            res.text()
                 .await
-                .context("Failed to read SMS 2FA error response text")?;
-            // try to parse as json, if it fails, just bail with the text
-            let error = Self::parse_sms_error(text, status.as_u16())?;
-
-            if error.code == "-28248" {
-                // Verification codes can’t be sent to this phone number at this time. Please try again later.
-                warn!("{} - {}", error.title, error.message);
-                self.last_error = format!("{} - {}", error.title, error.message).into();
-                return Ok(LoginState::NeedsUnknown2FA);
-            }
-
-            if error.code == "-22979" {
-                // Too many verification codes have been sent. - Enter the last code you received or try again later.
-                warn!("{} - {}", error.title, error.message);
-                self.last_error = format!("{} - {}", error.title, error.message).into();
-                return Ok(LoginState::NeedsUnknown2FA);
-            }
-
-            if error.code == "-22981" {
-                // Too many verification codes have been sent. - Enter the last code you received or try again later.
-                // Not sure why there are two identical errors with different codes
-                warn!("{} - {}", error.title, error.message);
-                self.last_error = format!("{} - {}", error.title, error.message).into();
-                return Ok(LoginState::NeedsUnknown2FA);
-            }
-
-            bail!(
-                "SMS 2FA request failed (code {}): {} - {}",
-                error.code,
-                error.title,
-                error.message
-            );
+                .context("Failed to read SMS 2FA response text")?
         };
 
-        info!("SMS 2FA request sent");
+        match Self::classify_sms_send_response(status.as_u16(), &text, id)? {
+            SmsSendOutcome::Sent => {
+                info!("SMS 2FA request sent");
+            }
+            SmsSendOutcome::ActiveChallenge => {
+                info!("SMS 2FA challenge already active, proceeding to verification");
+            }
+            SmsSendOutcome::ServiceError(error) => {
+                if error.code == "-28248" {
+                    warn!("{} - {}", error.title, error.message);
+                    self.last_error = format!("{} - {}", error.title, error.message).into();
+                    return Ok(LoginState::NeedsUnknown2FA);
+                }
+
+                if matches!(error.code.as_str(), "-22979" | "-22981") {
+                    // Apple refused to send a new SMS, but the last code sent is
+                    // still valid: keep the selected number and let the user
+                    // enter it without triggering another send.
+                    warn!("{} - {}", error.title, error.message);
+                    self.last_error = format!("{} - {}", error.title, error.message).into();
+                    return Ok(LoginState::NeedsSMS2FAVerification(id));
+                }
+
+                bail!(
+                    "SMS 2FA request failed (code {}): {} - {}",
+                    error.code,
+                    error.title,
+                    error.message
+                );
+            }
+        }
 
         Ok(LoginState::NeedsSMS2FAVerification(id))
     }
@@ -564,35 +596,76 @@ impl AppleAccount {
         Ok(LoginState::NeedsLogin)
     }
 
-    fn parse_sms_error(text: String, status: u16) -> Result<SMSTwoFactorError, Report> {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(&text)
-            && let Some(service_errors) = json.get("serviceErrors")
-            && let Some(first_error) = service_errors.as_array().and_then(|arr| arr.first())
-        {
-            let code = first_error
-                .get("code")
-                .and_then(|c| c.as_str())
-                .unwrap_or("unknown");
-            let title = first_error
-                .get("title")
-                .and_then(|t| t.as_str())
-                .unwrap_or("No title provided");
-            let message = first_error
-                .get("message")
-                .and_then(|m| m.as_str())
-                .unwrap_or("No message provided");
-
-            return Ok(SMSTwoFactorError {
-                code: code.to_string(),
-                title: title.to_string(),
-                message: message.to_string(),
-            });
+    fn classify_sms_send_response(
+        status: u16,
+        text: &str,
+        requested_number_id: u32,
+    ) -> Result<SmsSendOutcome, Report> {
+        if (200..300).contains(&status) {
+            return Ok(SmsSendOutcome::Sent);
         }
+
+        if let Some(error) = Self::parse_sms_service_error(text) {
+            return Ok(SmsSendOutcome::ServiceError(error));
+        }
+
+        if status == 412
+            && let Ok(challenge) = serde_json::from_str::<SmsChallengeResponse>(text)
+            && challenge.mode == "sms"
+            && challenge.challenge_type == "verification"
+            && challenge.authentication_type == "hsa2"
+            && challenge.trusted_phone_number.id == requested_number_id
+            && challenge
+                .trusted_phone_numbers
+                .iter()
+                .any(|number| number.id == requested_number_id)
+            && challenge.security_code.length == 6
+            && !challenge.security_code.too_many_codes_sent
+            && !challenge.security_code.too_many_codes_validated
+            && !challenge.security_code.security_code_locked
+            && !challenge.security_code.security_code_cooldown
+        {
+            return Ok(SmsSendOutcome::ActiveChallenge);
+        }
+
         bail!(
-            "SMS 2FA code submission failed with http status {}: {}",
+            "SMS 2FA request failed with http status {}: {}",
             status,
             text
         );
+    }
+
+    fn parse_sms_service_error(text: &str) -> Option<SMSTwoFactorError> {
+        let json = serde_json::from_str::<serde_json::Value>(text).ok()?;
+        let first_error = json.get("serviceErrors")?.as_array()?.first()?;
+        let code = first_error
+            .get("code")
+            .and_then(|c| c.as_str())
+            .unwrap_or("unknown");
+        let title = first_error
+            .get("title")
+            .and_then(|t| t.as_str())
+            .unwrap_or("No title provided");
+        let message = first_error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .unwrap_or("No message provided");
+
+        Some(SMSTwoFactorError {
+            code: code.to_string(),
+            title: title.to_string(),
+            message: message.to_string(),
+        })
+    }
+
+    fn parse_sms_error(text: String, status: u16) -> Result<SMSTwoFactorError, Report> {
+        Self::parse_sms_service_error(&text).ok_or_else(|| {
+            report!(
+                "SMS 2FA code submission failed with http status {}: {}",
+                status,
+                text
+            )
+        })
     }
 
     async fn get_trusted_numbers(&mut self) -> Result<Vec<TrustedNumber>, Report> {
@@ -670,6 +743,15 @@ impl AppleAccount {
         );
 
         Ok(headers)
+    }
+
+    fn login_state_for_auth_type(auth_type: &str) -> LoginState {
+        match auth_type {
+            "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
+            "secondaryAuth" => LoginState::NeedsUnknown2FA,
+            "repair" => LoginState::LoggedIn,
+            unknown => LoginState::NeedsExtraStep(unknown.to_string()),
+        }
     }
 
     async fn login_inner(&mut self, password: &str) -> Result<LoginState, Report> {
@@ -812,14 +894,7 @@ impl AppleAccount {
         debug!("Login step 2 completed");
 
         if let Some(plist::Value::String(s)) = status.get("au") {
-            return Ok(match s.as_str() {
-                "trustedDeviceSecondaryAuth" => LoginState::NeedsDevice2FA,
-                "secondaryAuth" => LoginState::NeedsSMS2FA(
-                    1, /* Just start by trying 1, user can correct after */
-                ),
-                "repair" => LoginState::LoggedIn, // Just means that you don't have 2FA set up
-                unknown => LoginState::NeedsExtraStep(unknown.to_string()),
-            });
+            return Ok(Self::login_state_for_auth_type(s));
         }
 
         Ok(LoginState::LoggedIn)
@@ -992,6 +1067,166 @@ impl AppleAccount {
         debug!("GCM decryption successful");
 
         Ok(buf)
+    }
+}
+
+#[cfg(test)]
+mod sms_send_response_tests {
+    use super::{AppleAccount, SmsSendOutcome};
+    use serde_json::{Value, json};
+
+    fn active_challenge() -> Value {
+        json!({
+            "trustedPhoneNumbers": [{
+                "numberWithDialCode": "+1 •• •• •• •• 00",
+                "lastTwoDigits": "00",
+                "pushMode": "sms",
+                "id": 2
+            }],
+            "securityCode": {
+                "length": 6,
+                "tooManyCodesSent": false,
+                "tooManyCodesValidated": false,
+                "securityCodeLocked": false,
+                "securityCodeCooldown": false
+            },
+            "mode": "sms",
+            "type": "verification",
+            "authenticationType": "hsa2",
+            "trustedPhoneNumber": {
+                "numberWithDialCode": "+1 •• •• •• •• 00",
+                "lastTwoDigits": "00",
+                "pushMode": "sms",
+                "id": 2
+            }
+        })
+    }
+
+    #[test]
+    fn sms_auth_requires_selecting_an_actual_trusted_phone_number() {
+        let state = AppleAccount::login_state_for_auth_type("secondaryAuth");
+
+        assert!(matches!(state, super::LoginState::NeedsUnknown2FA));
+    }
+
+    #[test]
+    fn accepts_success_status_without_a_response_body() {
+        let outcome = AppleAccount::classify_sms_send_response(200, "", 2).unwrap();
+
+        assert!(matches!(outcome, SmsSendOutcome::Sent));
+    }
+
+    #[test]
+    fn accepts_precondition_failed_when_the_requested_sms_challenge_is_active() {
+        let body = active_challenge().to_string();
+        let outcome = AppleAccount::classify_sms_send_response(412, &body, 2).unwrap();
+
+        assert!(matches!(outcome, SmsSendOutcome::ActiveChallenge));
+    }
+
+    #[test]
+    fn rejects_an_active_challenge_for_a_different_phone_number() {
+        let body = active_challenge().to_string();
+        let error = AppleAccount::classify_sms_send_response(412, &body, 3).unwrap_err();
+
+        assert!(error.to_string().contains("http status 412"));
+    }
+
+    #[test]
+    fn rejects_a_malformed_precondition_failed_response() {
+        let error = AppleAccount::classify_sms_send_response(
+            412,
+            r#"{"trustedPhoneNumbers":"invalid"}"#,
+            2,
+        )
+        .unwrap_err();
+
+        assert!(error.to_string().contains("http status 412"));
+    }
+
+    #[test]
+    fn rejects_an_active_challenge_with_any_lockout_flag() {
+        for flag in [
+            "tooManyCodesSent",
+            "tooManyCodesValidated",
+            "securityCodeLocked",
+            "securityCodeCooldown",
+        ] {
+            let mut challenge = active_challenge();
+            challenge["securityCode"][flag] = Value::Bool(true);
+
+            let error = AppleAccount::classify_sms_send_response(412, &challenge.to_string(), 2)
+                .unwrap_err();
+
+            assert!(
+                error.to_string().contains("http status 412"),
+                "flag {flag} should make the challenge invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_apple_service_errors_before_classifying_a_challenge() {
+        let body = json!({
+            "serviceErrors": [{
+                "code": "-22979",
+                "title": "Too many verification codes",
+                "message": "Enter the last code you received or try again later."
+            }]
+        })
+        .to_string();
+        let outcome = AppleAccount::classify_sms_send_response(412, &body, 2).unwrap();
+
+        match outcome {
+            SmsSendOutcome::ServiceError(error) => assert_eq!(error.code, "-22979"),
+            _ => panic!("expected the Apple service error to be preserved"),
+        }
+    }
+
+    #[test]
+    fn classifies_too_many_codes_sent_as_a_service_error() {
+        for code in ["-22979", "-22981"] {
+            let body = json!({
+                "serviceErrors": [{
+                    "code": code,
+                    "title": "Too many verification codes",
+                    "message": "Enter the last code you received or try again later."
+                }]
+            })
+            .to_string();
+            let outcome = AppleAccount::classify_sms_send_response(412, &body, 2).unwrap();
+
+            match outcome {
+                SmsSendOutcome::ServiceError(error) => assert_eq!(error.code, code),
+                _ => panic!("code {code} should be preserved as a service error"),
+            }
+        }
+    }
+
+    #[test]
+    fn classifies_unknown_2fa_method_as_a_service_error() {
+        let body = json!({
+            "serviceErrors": [{
+                "code": "-28248",
+                "title": "Unknown 2FA method",
+                "message": "Please select a different verification method."
+            }]
+        })
+        .to_string();
+        let outcome = AppleAccount::classify_sms_send_response(412, &body, 2).unwrap();
+
+        match outcome {
+            SmsSendOutcome::ServiceError(error) => assert_eq!(error.code, "-28248"),
+            _ => panic!("expected the Apple service error to be preserved"),
+        }
+    }
+
+    #[test]
+    fn rejects_an_unexpected_non_json_error_response_with_its_status() {
+        let error =
+            AppleAccount::classify_sms_send_response(500, "upstream failure", 2).unwrap_err();
+
+        assert!(error.to_string().contains("http status 500"));
     }
 }
 
