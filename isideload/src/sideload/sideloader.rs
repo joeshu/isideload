@@ -1,7 +1,7 @@
 use crate::{
     dev::{
         app_groups::AppGroupsApi,
-        app_ids::{AppIdsApi, Profile},
+        app_ids::{AppId, AppIdsApi, Profile},
         developer_session::DeveloperSession,
         devices::DevicesApi,
         teams::{DeveloperTeam, TeamsApi},
@@ -23,6 +23,25 @@ use idevice::provider::IdeviceProvider;
 use plist::Dictionary;
 use rootcause::{option_ext::OptionExt, prelude::*};
 use tracing::info;
+
+pub struct ExportedSigningIdentity {
+    pub p12: Vec<u8>,
+    pub p12_password: String,
+    pub team_id: String,
+    pub certificate_serial_number: String,
+    pub machine_id: String,
+    pub machine_name: String,
+}
+
+pub struct ExportedProvisioningProfile {
+    pub mobileprovision: Vec<u8>,
+    pub filename: String,
+    pub uuid: String,
+    pub name: String,
+    pub app_identifier: String,
+    pub expiration_date: String,
+    pub is_free_provisioning_profile: Option<bool>,
+}
 
 pub struct Sideloader {
     team_selection: TeamSelection,
@@ -61,6 +80,69 @@ impl Sideloader {
             delete_app_after_install,
             team: None,
         }
+    }
+
+    pub async fn export_signing_identity(
+        &mut self,
+        password: Option<&str>,
+    ) -> Result<ExportedSigningIdentity, Report> {
+        let team = self.get_team().await?;
+        let cert_identity = CertificateIdentity::retrieve(
+            &self.machine_name,
+            &self.apple_email,
+            &mut self.dev_session,
+            &team,
+            self.storage.as_ref(),
+            &self.max_certs_behavior,
+        )
+        .await
+        .context("Failed to retrieve certificate identity for export")?;
+
+        let p12_password = password
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| cert_identity.machine_id.clone());
+        let p12 = cert_identity
+            .as_p12(&p12_password)
+            .await
+            .context("Failed to export certificate identity as PKCS#12")?;
+
+        Ok(ExportedSigningIdentity {
+            p12,
+            p12_password,
+            team_id: team.team_id,
+            certificate_serial_number: cert_identity.get_serial_number(),
+            machine_id: cert_identity.machine_id,
+            machine_name: cert_identity.machine_name,
+        })
+    }
+
+    pub async fn export_provisioning_profile(
+        &mut self,
+        app_id_id: &str,
+    ) -> Result<ExportedProvisioningProfile, Report> {
+        let team = self.get_team().await?;
+        let response = self.dev_session.list_app_ids(&team, None).await?;
+        let app_id: AppId = response
+            .app_ids
+            .into_iter()
+            .find(|app| app.app_id_id == app_id_id)
+            .ok_or_else(|| report!("App ID not found: {}", app_id_id))?;
+
+        let profile = self
+            .dev_session
+            .download_team_provisioning_profile(&team, &app_id, None)
+            .await
+            .context("Failed to download provisioning profile for export")?;
+
+        Ok(ExportedProvisioningProfile {
+            mobileprovision: profile.encoded_profile.as_ref().to_vec(),
+            filename: profile.filename,
+            uuid: profile.uuid,
+            name: profile.name,
+            app_identifier: app_id.identifier,
+            expiration_date: format!("{:?}", profile.date_expire),
+            is_free_provisioning_profile: profile.is_free_provisioning_profile,
+        })
     }
 
     /// Sign the app at the provided path and return the path to the signed app bundle (in a temp dir). To sign and install, see [`Self::install_app`].
